@@ -8,6 +8,7 @@ import warnings
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms as TF
 
@@ -57,12 +58,91 @@ def load_and_preprocess_images(image_path_list, mode="balanced", image_resolutio
     return torch.stack(images)
 
 
+def load_and_preprocess_image_tensors(image_tensor, mode="balanced", image_resolution=512, patch_size=16, device=None):
+    """Preprocess RGB tensors for VGGT-Omega without an image-file roundtrip.
+
+    Accepts torchcodec-style frames in [T, 3, H, W] uint8 RGB and returns
+    [T, 3, target_h, target_w] float32 images in [0, 1].
+    """
+    if mode not in ["balanced", "max_size"]:
+        raise ValueError("Mode must be either 'balanced' or 'max_size'")
+    if image_resolution <= 0:
+        raise ValueError("image_resolution must be positive")
+    if patch_size <= 0:
+        raise ValueError("patch_size must be positive")
+    if image_resolution % patch_size != 0:
+        raise ValueError("image_resolution must be divisible by patch_size")
+
+    images = _normalize_image_tensor_batch(image_tensor, device=device)
+    if images.shape[0] == 0:
+        raise ValueError("At least 1 image is required")
+
+    images = _crop_tensor_batch_to_supported_aspect_ratio(images)
+    height, width = images.shape[-2:]
+    aspect_ratio = height / max(width, 1)
+    if mode == "balanced":
+        target_h, target_w = _balanced_target_shape(aspect_ratio, image_resolution, patch_size)
+    else:
+        target_h, target_w = _max_size_target_shape(aspect_ratio, image_resolution, patch_size)
+
+    images = F.interpolate(
+        images,
+        size=(target_h, target_w),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    )
+    return images.clamp(0.0, 1.0).contiguous()
+
+
 def _load_rgb_image(image_path):
     with Image.open(image_path) as image:
         if image.mode == "RGBA":
             background = Image.new("RGBA", image.size, (255, 255, 255, 255))
             image = Image.alpha_composite(background, image)
         return image.convert("RGB")
+
+
+def _normalize_image_tensor_batch(image_tensor, device=None):
+    if not torch.is_tensor(image_tensor):
+        raise TypeError(f"Expected a torch.Tensor image batch, got {type(image_tensor)!r}")
+    if image_tensor.ndim == 3:
+        image_tensor = image_tensor.unsqueeze(0)
+    if image_tensor.ndim != 4:
+        raise ValueError(f"Expected image tensor shape [T,3,H,W] or [T,H,W,3], got {tuple(image_tensor.shape)}")
+
+    if image_tensor.shape[1] == 3:
+        images = image_tensor
+    elif image_tensor.shape[-1] == 3:
+        images = image_tensor.permute(0, 3, 1, 2)
+    else:
+        raise ValueError(f"Expected RGB channel dimension of size 3, got {tuple(image_tensor.shape)}")
+
+    target_device = device if device is not None else images.device
+    if images.dtype == torch.uint8:
+        images = images.to(device=target_device, dtype=torch.float32, non_blocking=True).div_(255.0)
+    elif images.is_floating_point():
+        images = images.to(device=target_device, dtype=torch.float32, non_blocking=True)
+    else:
+        raise TypeError(f"Expected uint8 or floating point RGB tensor, got {images.dtype}")
+    return images.contiguous()
+
+
+def _crop_tensor_batch_to_supported_aspect_ratio(images, min_aspect_ratio=0.5, max_aspect_ratio=2.0):
+    height, width = images.shape[-2:]
+    aspect_ratio = height / max(width, 1)
+
+    if aspect_ratio < min_aspect_ratio:
+        crop_width = min(width, max(1, int(round(height / min_aspect_ratio))))
+        left = max((width - crop_width) // 2, 0)
+        return images[..., :, left:left + crop_width]
+
+    if aspect_ratio > max_aspect_ratio:
+        crop_height = min(height, max(1, int(round(width * max_aspect_ratio))))
+        top = max((height - crop_height) // 2, 0)
+        return images[..., top:top + crop_height, :]
+
+    return images
 
 
 def _crop_to_supported_aspect_ratio(image, min_aspect_ratio=0.5, max_aspect_ratio=2.0):

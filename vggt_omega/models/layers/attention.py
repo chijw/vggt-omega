@@ -19,6 +19,37 @@ import torch.nn.functional as F
 from .utils import cat_keep_shapes, uncat_with_shapes
 
 
+def _flash_attention_3(q: Tensor, k: Tensor, v: Tensor, *, causal: bool) -> Tensor:
+    try:
+        import flash_attn_interface
+    except ImportError as exc:
+        raise ImportError(
+            "flash_attn_3 is required in this environment; install the package "
+            "that provides flash_attn_interface.flash_attn_func."
+        ) from exc
+
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise RuntimeError("FlashAttention-3 requires CUDA tensors.")
+    output_dtype = q.dtype
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        if q.dtype != torch.float32:
+            raise RuntimeError(
+                f"FlashAttention-3 requires fp16/bf16 tensors, got {q.dtype}."
+            )
+        target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        q = q.to(target_dtype)
+        k = k.to(target_dtype)
+        v = v.to(target_dtype)
+
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    v = v.transpose(1, 2).contiguous()
+    out = flash_attn_interface.flash_attn_func(q, k, v, causal=causal)
+    if isinstance(out, tuple):
+        out = out[0]
+    return out.transpose(1, 2).to(output_dtype)
+
+
 # RoPE-related functions:
 def rope_rotate_half(x: Tensor) -> Tensor:
     # x:   [ x0  x1  x2  x3  x4  x5]
@@ -133,7 +164,7 @@ class SelfAttention(nn.Module):
             k = self.k_norm(k)
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
-        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        x = _flash_attention_3(q, k, v, causal=False)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])
 
@@ -176,9 +207,9 @@ class CausalSelfAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
         q, k, v = torch.unbind(qkv, 2)
         q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
-        x = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=self.attn_drop if self.training else 0, is_causal=is_causal
-        )
+        if self.training and self.attn_drop:
+            raise RuntimeError("FlashAttention-3 path does not support attention dropout.")
+        x = _flash_attention_3(q, k, v, causal=is_causal)
         x = x.transpose(1, 2).contiguous().view(B, N, C)
         x = self.proj_drop(self.proj(x))
         return x
