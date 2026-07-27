@@ -41,6 +41,14 @@ class CameraHead(nn.Module):
             nn.GELU(),
             nn.Linear(dim_in // 2, 9, bias=True),
         )
+        self._compiled_token_forward = None
+
+    def compile_token_forward(self, **compile_kwargs) -> None:
+        if self._compiled_token_forward is None:
+            self._compiled_token_forward = torch.compile(
+                self._forward_camera_tokens,
+                **compile_kwargs,
+            )
 
     def forward(
         self,
@@ -57,10 +65,22 @@ class CameraHead(nn.Module):
         if patch_token_start > num_tokens:
             raise ValueError(f"patch_token_start ({patch_token_start}) exceeds token length ({num_tokens})")
 
-        if tokens.dtype != torch.float32:
-            tokens = tokens.float()
-
         camera_and_register_tokens = tokens[:, :, :patch_token_start]
+        # The camera head consumes only the small camera/register prefix.  Cast
+        # after slicing so we do not materialize every patch token in fp32 just
+        # to discard it immediately afterwards.
+        if camera_and_register_tokens.dtype != torch.float32:
+            camera_and_register_tokens = camera_and_register_tokens.float()
+        if self._compiled_token_forward is not None:
+            # Normalize the boundary from a potentially compiled aggregator.
+            # Passing the complete multi-scale token list into another compiled
+            # graph can otherwise force expensive layout materialization.
+            camera_and_register_tokens = camera_and_register_tokens.contiguous()
+            return self._compiled_token_forward(camera_and_register_tokens)
+        return self._forward_camera_tokens(camera_and_register_tokens)
+
+    def _forward_camera_tokens(self, camera_and_register_tokens: torch.Tensor) -> torch.Tensor:
+        batch_size, num_frames, patch_token_start, _ = camera_and_register_tokens.shape
         camera_and_register_tokens = self.token_norm(camera_and_register_tokens)
 
         camera_and_register_tokens = camera_and_register_tokens.reshape(batch_size, num_frames * patch_token_start, -1)

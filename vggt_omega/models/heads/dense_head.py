@@ -68,6 +68,26 @@ class DenseHead(nn.Module):
             self.final_shuffle_factor**2,
         )
         _init_small_conf_prediction_head(self.proj_conf)
+        # torch.compile is installed lazily after checkpoint loading and CUDA
+        # placement.  Keep the length-dependent Python scheduler eager and
+        # compile only the tensor-only per-chunk kernel below.
+        self._compiled_chunk_forward = None
+        self._compiled_chunk_frames = 0
+
+    def compile_chunk_forward(self, *, frames_chunk_size: int = 8, **compile_kwargs) -> None:
+        if frames_chunk_size <= 0:
+            raise ValueError(f"frames_chunk_size must be positive, got {frames_chunk_size}")
+        if self._compiled_chunk_forward is None:
+            # Every compiled invocation is padded to this fixed frame count in
+            # _run_chunk.  A static graph is both faster and avoids one graph
+            # for each possible final-tail length.
+            compile_kwargs = dict(compile_kwargs)
+            compile_kwargs["dynamic"] = False
+            self._compiled_chunk_forward = torch.compile(
+                self._forward_features_impl,
+                **compile_kwargs,
+            )
+            self._compiled_chunk_frames = int(frames_chunk_size)
 
     def forward(
         self,
@@ -82,7 +102,12 @@ class DenseHead(nn.Module):
         _, num_frames, _, _, _ = images.shape
 
         if frames_chunk_size is None or frames_chunk_size >= num_frames:
-            return self._forward_impl(aggregated_tokens_list, images, patch_token_start)
+            features = self._extract_features(
+                aggregated_tokens_list,
+                patch_token_start,
+                make_contiguous=self._compiled_chunk_forward is not None,
+            )
+            return self._run_chunk(features, images.shape[-2:])
 
         assert frames_chunk_size > 0
 
@@ -90,12 +115,16 @@ class DenseHead(nn.Module):
         depth_conf_chunks = []
         for frames_start_idx in range(0, num_frames, frames_chunk_size):
             frames_end_idx = min(frames_start_idx + frames_chunk_size, num_frames)
-            depth_chunk, depth_conf_chunk = self._forward_impl(
+            features = self._extract_features(
                 aggregated_tokens_list,
-                images,
                 patch_token_start,
-                frames_start_idx,
-                frames_end_idx,
+                frames_start_idx=frames_start_idx,
+                frames_end_idx=frames_end_idx,
+                make_contiguous=self._compiled_chunk_forward is not None,
+            )
+            depth_chunk, depth_conf_chunk = self._run_chunk(
+                features,
+                images.shape[-2:],
             )
             depth_chunks.append(depth_chunk)
             depth_conf_chunks.append(depth_conf_chunk)
@@ -110,20 +139,75 @@ class DenseHead(nn.Module):
         frames_start_idx: int | None = None,
         frames_end_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if frames_start_idx is not None and frames_end_idx is not None:
-            images = images[:, frames_start_idx:frames_end_idx].contiguous()
+        features = self._extract_features(
+            aggregated_tokens_list,
+            patch_token_start,
+            frames_start_idx=frames_start_idx,
+            frames_end_idx=frames_end_idx,
+            make_contiguous=False,
+        )
+        return self._forward_features_impl(features, images.shape[-2:])
 
-        batch_size, num_frames, _, height, width = images.shape
+    def _extract_features(
+        self,
+        aggregated_tokens_list: list[torch.Tensor | None],
+        patch_token_start: int,
+        *,
+        frames_start_idx: int | None = None,
+        frames_end_idx: int | None = None,
+        make_contiguous: bool,
+    ) -> list[torch.Tensor]:
+        features = []
+        for layer_idx in self.intermediate_layer_idx:
+            tokens = aggregated_tokens_list[layer_idx]
+            if tokens is None:
+                raise ValueError(f"Aggregator did not cache layer {layer_idx}, which DenseHead needs.")
+            if frames_start_idx is not None and frames_end_idx is not None:
+                tokens = tokens[:, frames_start_idx:frames_end_idx]
+            tokens = tokens[:, :, patch_token_start:]
+            if make_contiguous:
+                tokens = tokens.contiguous()
+            features.append(tokens)
+        return features
+
+    def _run_chunk(
+        self,
+        features: list[torch.Tensor],
+        image_size: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_frames = int(features[0].shape[1])
+        if self._compiled_chunk_forward is not None:
+            if num_frames <= self._compiled_chunk_frames:
+                if num_frames < self._compiled_chunk_frames:
+                    pad_frames = self._compiled_chunk_frames - num_frames
+                    features = [
+                        torch.cat(
+                            [
+                                tokens,
+                                tokens[:, -1:].expand(-1, pad_frames, -1, -1),
+                            ],
+                            dim=1,
+                        )
+                        for tokens in features
+                    ]
+                depth, depth_conf = self._compiled_chunk_forward(
+                    features,
+                    image_size,
+                )
+                return depth[:, :num_frames], depth_conf[:, :num_frames]
+        return self._forward_features_impl(features, image_size)
+
+    def _forward_features_impl(
+        self,
+        features: list[torch.Tensor],
+        image_size: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_frames = features[0].shape[:2]
+        height, width = image_size
         patch_h, patch_w = height // self.patch_size, width // self.patch_size
 
         multi_scale_features = []
-        for feature_idx, layer_idx in enumerate(self.intermediate_layer_idx):
-            x = aggregated_tokens_list[layer_idx]
-            if x is None:
-                raise ValueError(f"Aggregator did not cache layer {layer_idx}, which DenseHead needs.")
-            x = x[:, :, patch_token_start:]
-            if frames_start_idx is not None and frames_end_idx is not None:
-                x = x[:, frames_start_idx:frames_end_idx]
+        for feature_idx, x in enumerate(features):
             if x.dtype != torch.float32:
                 x = x.float()
 

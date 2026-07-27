@@ -32,7 +32,12 @@ class VGGTOmega(nn.Module):
         self.dense_head = DenseHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_depth else None
         self.text_alignment_head = TextAlignmentHead(dim_in=2 * embed_dim) if enable_alignment else None
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        *,
+        return_camera_and_register_tokens: bool = True,
+    ) -> dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
 
@@ -44,9 +49,9 @@ class VGGTOmega(nn.Module):
         if final_tokens is None:
             raise ValueError("Aggregator did not cache the final layer, which VGGTOmega needs.")
 
-        predictions = {
-            "camera_and_register_tokens": final_tokens[:, :, :patch_token_start].contiguous(),
-        }
+        predictions = {}
+        if return_camera_and_register_tokens:
+            predictions["camera_and_register_tokens"] = final_tokens[:, :, :patch_token_start].contiguous()
         with torch.autocast(device_type="cuda", enabled=False):
             if self.camera_head is not None:
                 predictions["pose_enc"] = self.camera_head(
